@@ -26,8 +26,11 @@ http.createServer((req, res) => {
 const CONFIG = {
     DISCORD_TOKEN: process.env.DISCORD_TOKEN,
     CLIENT_ID: process.env.CLIENT_ID,
-    GUILD_ID: process.env.GUILD_ID || null, // Se preenchido, registra os comandos instantaneamente nesse servidor
+    GUILD_ID: process.env.GUILD_ID || null,
     
+    // Canal permitido para o comando /coordenadas
+    ALLOWED_CHANNEL_ID: '1554309905736011817',
+
     // Conexão RCON com o Servidor Minecraft
     RCON_HOST: process.env.RCON_HOST || '127.0.0.1',
     RCON_PORT: parseInt(process.env.RCON_PORT || '25575', 10),
@@ -200,6 +203,14 @@ client.on('interactionCreate', async (interaction) => {
 
     // --- COMANDO: /coordenadas ---
     if (commandName === 'coordenadas') {
+        // Restrição para funcionar apenas no canal especificado
+        if (CONFIG.ALLOWED_CHANNEL_ID && interaction.channelId !== CONFIG.ALLOWED_CHANNEL_ID) {
+            return interaction.reply({
+                content: `❌ Este comando só pode ser utilizado no canal <#${CONFIG.ALLOWED_CHANNEL_ID}>.`,
+                ephemeral: true
+            });
+        }
+
         const coords = loadCoords();
 
         if (coords.length === 0) {
@@ -304,7 +315,7 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 process.on('uncaughtException', (error, origin) => {
-    console.error('⚠️ [Anti-Crash] Exceção não capturada:', error);
+    console.error('⚠️️ [Anti-Crash] Exceção não capturada:', error);
 });
 
 // ================= 8. INICIALIZAÇÃO DO BOT =================
