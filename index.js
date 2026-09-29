@@ -1,281 +1,315 @@
-require('dotenv').config();
-const http = require('http');
 const { 
-  Client, 
-  GatewayIntentBits, 
-  EmbedBuilder, 
-  ActionRowBuilder, 
-  ButtonBuilder, 
-  ButtonStyle 
+    Client, 
+    GatewayIntentBits, 
+    REST, 
+    Routes, 
+    SlashCommandBuilder, 
+    PermissionFlagsBits, 
+    EmbedBuilder 
 } = require('discord.js');
-const util = require('minecraft-server-util');
+const { Rcon } = require('rcon-client');
+const fs = require('fs');
+const path = require('path');
+const http = require('http');
 
-// ==========================================
-// CONFIGURAÇÕES E VARIÁVEIS DE AMBIENTE
-// ==========================================
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const MC_HOST = process.env.MC_HOST || 'Panelacraft.astral.ovh';
-const MC_PORT = parseInt(process.env.MC_PORT || '25941', 10);
-const STATUS_CHANNEL_ID = process.env.STATUS_CHANNEL_ID;
-const UPDATE_SECONDS = parseInt(process.env.UPDATE_SECONDS || '15', 10);
-const PORT = process.env.PORT || 8080;
-const IGNORED_PLAYERS = (process.env.IGNORED_PLAYERS || '')
-  .split(',')
-  .map(p => p.trim().toLowerCase())
-  .filter(Boolean);
-
-// Validação de variáveis obrigatórias
-if (!DISCORD_TOKEN) {
-  console.error('❌ ERRO: DISCORD_TOKEN não foi definido!');
-  process.exit(1);
-}
-
-if (!STATUS_CHANNEL_ID) {
-  console.error('❌ ERRO: STATUS_CHANNEL_ID não foi definido!');
-  process.exit(1);
-}
-
-// Inicialização do cliente do Discord
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages
-  ]
-});
-
-let statusMessage = null;
-
-// ==========================================
-// FUNÇÕES AUXILIARES
-// ==========================================
-
-// Gera a barra de progresso visual para os slots de jogadores
-function createProgressBar(current, max, size = 10) {
-  if (!max || max <= 0) return '░░░░░░░░░░';
-  const percentage = Math.min(Math.max(current / max, 0), 1);
-  const progress = Math.round(size * percentage);
-  const emptyProgress = size - progress;
-  return '🟩'.repeat(progress) + '⬜'.repeat(emptyProgress);
-}
-
-// Consulta o status do servidor Minecraft (Socket Direto + Fallback REST)
-async function fetchMinecraftStatus() {
-  // Tentativa 1: Socket direto via minecraft-server-util
-  try {
-    const result = await util.status(MC_HOST, MC_PORT, {
-      timeout: 5000,
-      enableSRV: true
-    });
-
-    const samplePlayers = result.players.sample || [];
-    const validPlayers = samplePlayers
-      .filter(player => !IGNORED_PLAYERS.includes(player.name.toLowerCase()))
-      .map(p => p.name);
-
-    return {
-      online: true,
-      playersOnline: Math.max(0, validPlayers.length),
-      maxPlayers: result.players.max,
-      playerList: validPlayers,
-      version: result.version.name,
-      ping: result.roundTripLatency,
-      motd: result.motd.clean || 'panela Craft'
-    };
-  } catch (primaryError) {
-    // Tentativa 2: Fallback via API REST (MCSrvStat)
-    try {
-      const response = await fetch(`https://api.mcsrvstat.us/3/${MC_HOST}:${MC_PORT}`);
-      const data = await response.json();
-
-      if (data.online) {
-        const playerList = data.players?.list || [];
-        const validPlayers = playerList.filter(name => 
-          !IGNORED_PLAYERS.includes(name.toLowerCase())
-        );
-
-        return {
-          online: true,
-          playersOnline: Math.max(0, validPlayers.length),
-          maxPlayers: data.players?.max || 20,
-          playerList: validPlayers,
-          version: data.version || '1.20.x',
-          ping: data.debug?.ping || 50,
-          motd: data.motd?.clean?.[0] || 'panela Craft'
-        };
-      }
-    } catch (fallbackError) {
-      // Falha em ambas as tentativas
-    }
-
-    return { online: false };
-  }
-}
-
-// Constrói o Embed principal de Status do Servidor
-function buildStatusEmbed(data) {
-  const fullAddress = `${MC_HOST}:${MC_PORT}`;
-
-  if (!data.online) {
-    return new EmbedBuilder()
-      .setColor(0xE74C3C) // Vermelho
-      .setTitle('🎮 Status do Servidor panela Craft')
-      .setDescription('🔴 **O servidor está atualmente OFFLINE.**\nAguarde o reinício ou verifique com a administração.')
-      .addFields(
-        { name: '🌐 IP do Servidor', value: `\`\`\`${fullAddress}\`\`\``, inline: false },
-        { name: '📊 Estado', value: '🔴 **OFFLINE**', inline: true }
-      )
-      .setThumbnail('https://cdn.icon-icons.com/icons2/2699/PNG/512/minecraft_logo_icon_168974.png')
-      .setFooter({ text: 'panela Craft • Monitorização em Tempo Real' })
-      .setTimestamp();
-  }
-
-  const progressBar = createProgressBar(data.playersOnline, data.maxPlayers);
-  const pingEmoji = data.ping < 100 ? '🟢' : data.ping < 200 ? '🟡' : '🔴';
-
-  return new EmbedBuilder()
-    .setColor(0x2ECC71) // Verde
-    .setTitle('🎮 Status do Servidor panela Craft')
-    .setDescription('🟢 **O servidor está ONLINE e pronto para jogar!**')
-    .setThumbnail('https://cdn.icon-icons.com/icons2/2699/PNG/512/minecraft_logo_icon_168974.png')
-    .addFields(
-      {
-        name: '🌐 IP do Servidor (Clique para copiar)',
-        value: `\`\`\`${fullAddress}\`\`\``,
-        inline: false
-      },
-      {
-        name: '📊 Estado',
-        value: '🟢 **ONLINE**',
-        inline: true
-      },
-      {
-        name: '🏷️ Versão',
-        value: `\`${data.version}\``,
-        inline: true
-      },
-      {
-        name: '⚡ Latência',
-        value: `${pingEmoji} \`${data.ping}ms\``,
-        inline: true
-      },
-      {
-        name: `👥 Jogadores Online (${data.playersOnline}/${data.maxPlayers})`,
-        value: `${progressBar}\n\`${data.playersOnline} de ${data.maxPlayers} slots ocupados\``,
-        inline: false
-      }
-    )
-    .setFooter({ text: 'panela Craft • Monitorização em Tempo Real' })
-    .setTimestamp();
-}
-
-// Cria a linha contendo o botão "Ver quem está online"
-function buildActionRow() {
-  const btn = new ButtonBuilder()
-    .setCustomId('btn_ver_jogadores')
-    .setLabel('Ver quem está online')
-    .setEmoji('👥')
-    .setStyle(ButtonStyle.Primary);
-
-  return new ActionRowBuilder().addComponents(btn);
-}
-
-// Atualiza a mensagem do painel no canal do Discord
-async function updateStatus() {
-  try {
-    const channel = await client.channels.fetch(STATUS_CHANNEL_ID);
-    if (!channel) {
-      console.error(`❌ Canal com ID ${STATUS_CHANNEL_ID} não encontrado!`);
-      return;
-    }
-
-    const statusData = await fetchMinecraftStatus();
-    const embed = buildStatusEmbed(statusData);
-    const row = buildActionRow();
-
-    // Reutiliza a mensagem salva em memória se existir
-    if (statusMessage) {
-      await statusMessage.edit({ embeds: [embed], components: [row] });
-      return;
-    }
-
-    // Caso o bot tenha reiniciado, procura a mensagem anterior no canal para não duplicar
-    const messages = await channel.messages.fetch({ limit: 10 });
-    const botMsg = messages.find(m => m.author.id === client.user.id);
-
-    if (botMsg) {
-      statusMessage = await botMsg.edit({ embeds: [embed], components: [row] });
-    } else {
-      statusMessage = await channel.send({ embeds: [embed], components: [row] });
-    }
-  } catch (error) {
-    console.error('⚠️ Erro ao atualizar o painel de status:', error.message);
-  }
-}
-
-// ==========================================
-// EVENTOS DO DISCORD
-// ==========================================
-
-// Listener para o clique no botão (Resposta Privada/Efêmera)
-client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isButton()) return;
-
-  if (interaction.customId === 'btn_ver_jogadores') {
-    try {
-      // Adia a resposta em modo privado/efêmero (só quem clicou consegue ver)
-      await interaction.deferReply({ ephemeral: true });
-
-      const status = await fetchMinecraftStatus();
-
-      if (!status.online) {
-        return await interaction.editReply({
-          content: '🔴 **O servidor panela Craft está offline no momento.**'
-        });
-      }
-
-      const players = status.playerList || [];
-      let responseText = `📊 **Jogadores Online no panela Craft (${status.playersOnline}/${status.maxPlayers}):**\n\n`;
-
-      if (players.length > 0) {
-        const playerListFormatted = players.map(name => `• \`${name}\``).join('\n');
-        responseText += playerListFormatted;
-      } else {
-        responseText += '*Nenhum jogador conectado no momento.*';
-      }
-
-      await interaction.editReply({
-        content: responseText
-      });
-    } catch (err) {
-      console.error('Erro ao processar clique no botão:', err);
-      if (interaction.deferred || interaction.replied) {
-        await interaction.editReply({ content: '❌ Ocorreu um erro ao carregar a lista de jogadores.' });
-      }
-    }
-  }
-});
-
-// Evento disparado quando o bot se conecta
-client.once('ready', () => {
-  console.log(`✅ Bot conectado com sucesso como: ${client.user.tag}`);
-  console.log(`📍 Monitorizando o servidor: ${MC_HOST}:${MC_PORT}`);
-
-  // Atualização inicial
-  updateStatus();
-
-  // Loop de atualização a cada X segundos
-  setInterval(updateStatus, UPDATE_SECONDS * 1000);
-});
-
-// ==========================================
-// SERVIDOR WEB (KEEP-ALIVE PARA RENDER/KOYEB)
-// ==========================================
+// ================= 1. SERVIDOR WEBPAGE PARA REPLIT & UPTIMEROBOT =================
+const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('Bot panela Craft está ativo e operacional!');
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.write('🤖 Bot de Coordenadas Minecraft rodando com sucesso no Replit!');
+    res.end();
 }).listen(PORT, () => {
-  console.log(`🌐 Servidor Web HTTP ativo na porta ${PORT}`);
+    console.log(`🌐 Servidor Keep-Alive rodando na porta ${PORT}`);
 });
 
-// Conectar o bot ao Discord
-client.login(DISCORD_TOKEN);
+// ================= 2. CONFIGURAÇÕES E VARIÁVEIS DE AMBIENTE =================
+const CONFIG = {
+    DISCORD_TOKEN: process.env.DISCORD_TOKEN,
+    CLIENT_ID: process.env.CLIENT_ID,
+    GUILD_ID: process.env.GUILD_ID || null, // Se preenchido, registra os comandos instantaneamente nesse servidor
+    
+    // Conexão RCON com o Servidor Minecraft
+    RCON_HOST: process.env.RCON_HOST || '127.0.0.1',
+    RCON_PORT: parseInt(process.env.RCON_PORT || '25575', 10),
+    RCON_PASSWORD: process.env.RCON_PASSWORD || ''
+};
+
+const COORDS_FILE = path.join(__dirname, 'coordenadas.json');
+
+// ================= 3. FUNÇÕES AUXILIARES DE ARQUIVO =================
+function loadCoords() {
+    try {
+        if (!fs.existsSync(COORDS_FILE)) {
+            fs.writeFileSync(COORDS_FILE, JSON.stringify([], null, 2));
+            return [];
+        }
+        const data = fs.readFileSync(COORDS_FILE, 'utf8');
+        return JSON.parse(data);
+    } catch (err) {
+        console.error('⚠️ Erro ao carregar coordenadas.json:', err.message);
+        return [];
+    }
+}
+
+function saveCoords(coords) {
+    try {
+        fs.writeFileSync(COORDS_FILE, JSON.stringify(coords, null, 2));
+    } catch (err) {
+        console.error('⚠️ Erro ao salvar coordenadas.json:', err.message);
+    }
+}
+
+// ================= 4. FUNÇÃO DE CONEXÃO RCON =================
+async function sendRconCommand(command) {
+    let rcon;
+    try {
+        rcon = await Rcon.connect({
+            host: CONFIG.RCON_HOST,
+            port: CONFIG.RCON_PORT,
+            password: CONFIG.RCON_PASSWORD,
+            timeout: 5000
+        });
+        const response = await rcon.send(command);
+        await rcon.end();
+        return { success: true, response };
+    } catch (error) {
+        if (rcon) {
+            try { await rcon.end(); } catch (_) {}
+        }
+        console.error(`⚠️ [RCON Error] Comando "${command}" falhou:`, error.message);
+        return { success: false, error: error.message };
+    }
+}
+
+// ================= 5. CONFIGURAÇÃO DO BOT DISCORD =================
+const client = new Client({
+    intents: [GatewayIntentBits.Guilds]
+});
+
+// Definição dos Slash Commands (/comandos)
+const commands = [
+    new SlashCommandBuilder()
+        .setName('adicionar-coordenada')
+        .setDescription('Salva uma nova coordenada/warp no bot e no servidor')
+        .addStringOption(opt => opt.setName('nome').setDescription('Nome da coordenada/warp').setRequired(true))
+        .addIntegerOption(opt => opt.setName('x').setDescription('Coordenada X').setRequired(true))
+        .addIntegerOption(opt => opt.setName('y').setDescription('Coordenada Y').setRequired(true))
+        .addIntegerOption(opt => opt.setName('z').setDescription('Coordenada Z').setRequired(true))
+        .addStringOption(opt => opt.setName('dimensao').setDescription('Dimensão (Overworld, Nether, End)').setRequired(false)),
+
+    new SlashCommandBuilder()
+        .setName('coordenadas')
+        .setDescription('Lista todas as coordenadas salvas'),
+
+    new SlashCommandBuilder()
+        .setName('teleportar')
+        .setDescription('Teleporta um jogador para um warp salvo no servidor')
+        .addStringOption(opt => opt.setName('nome').setDescription('Nome do warp').setRequired(true))
+        .addStringOption(opt => opt.setName('nick').setDescription('Seu Nick exato no Minecraft').setRequired(true)),
+
+    new SlashCommandBuilder()
+        .setName('deletar-coordenada')
+        .setDescription('Exclui uma coordenada (Restrito a Administradores ou ao Criador)')
+        .addStringOption(opt => opt.setName('nome').setDescription('Nome da coordenada a excluir').setRequired(true))
+].map(cmd => cmd.toJSON());
+
+// Registrar comandos no Discord
+async function registerCommands() {
+    if (!CONFIG.DISCORD_TOKEN || !CONFIG.CLIENT_ID) {
+        console.error('❌ ERRO CRÍTICO: DISCORD_TOKEN ou CLIENT_ID não configurados nas variáveis de ambiente!');
+        return;
+    }
+
+    const rest = new REST({ version: '10' }).setToken(CONFIG.DISCORD_TOKEN);
+    try {
+        console.log('🔄 Atualizando comandos Slash (/)...');
+        if (CONFIG.GUILD_ID) {
+            await rest.put(Routes.applicationGuildCommands(CONFIG.CLIENT_ID, CONFIG.GUILD_ID), { body: commands });
+            console.log('✅ Comandos salvos instantaneamente no Servidor (GUILD_ID)!');
+        } else {
+            await rest.put(Routes.applicationCommands(CONFIG.CLIENT_ID), { body: commands });
+            console.log('✅ Comandos salvos Globalmente!');
+        }
+    } catch (error) {
+        console.error('❌ Erro ao registrar comandos:', error);
+    }
+}
+
+client.once('ready', () => {
+    console.log(`🤖 Bot iniciado com sucesso como: ${client.user.tag}`);
+    registerCommands();
+});
+
+// ================= 6. MANIPULADOR DE INTERAÇÕES (/COMANDOS) =================
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isChatInputCommand()) return;
+
+    const { commandName } = interaction;
+
+    // --- COMANDO: /adicionar-coordenada ---
+    if (commandName === 'adicionar-coordenada') {
+        await interaction.deferReply();
+
+        const name = interaction.options.getString('nome').toLowerCase().trim();
+        const x = interaction.options.getInteger('x');
+        const y = interaction.options.getInteger('y');
+        const z = interaction.options.getInteger('z');
+        const dim = interaction.options.getString('dimensao') || 'Overworld';
+
+        let coords = loadCoords();
+        if (coords.some(c => c.name.toLowerCase() === name)) {
+            return interaction.editReply(`❌ Já existe uma coordenada cadastrada com o nome **${name}**.`);
+        }
+
+        const newCoord = {
+            name,
+            x,
+            y,
+            z,
+            dimension: dim,
+            authorId: interaction.user.id,
+            authorTag: interaction.user.tag,
+            createdAt: new Date().toISOString()
+        };
+
+        coords.push(newCoord);
+        saveCoords(coords);
+
+        // Tenta executar o /setwarp no servidor Minecraft
+        const rconResult = await sendRconCommand(`setwarp ${name}`);
+
+        const embed = new EmbedBuilder()
+            .setTitle('📍 Coordenada Adicionada!')
+            .setColor(0x2ECC71)
+            .addFields(
+                { name: '🔖 Nome', value: `\`${name}\``, inline: true },
+                { name: '📍 Pos (X, Y, Z)', value: `\`${x}, ${y}, ${z}\``, inline: true },
+                { name: '🌍 Dimensão', value: dim, inline: true },
+                { name: '👤 Criador', value: `<@${interaction.user.id}>`, inline: false }
+            )
+            .setTimestamp();
+
+        if (!rconResult.success) {
+            embed.setFooter({ text: `Aviso: Salvo no Discord. Falha ao executar no Minecraft (${rconResult.error})` });
+        } else {
+            embed.setFooter({ text: 'Sincronizado com o plugin SimpleWarp no Minecraft!' });
+        }
+
+        return interaction.editReply({ embeds: [embed] });
+    }
+
+    // --- COMANDO: /coordenadas ---
+    if (commandName === 'coordenadas') {
+        const coords = loadCoords();
+
+        if (coords.length === 0) {
+            return interaction.reply({ content: '📂 Nenhuma coordenada cadastrada ainda.', ephemeral: true });
+        }
+
+        const listText = coords.map((c, i) => 
+            `**${i + 1}. \`${c.name}\`** ➔ \`X: ${c.x} | Y: ${c.y} \vert{} Z:${c.z}\` (${c.dimension})\n└ Criado por: <@${c.authorId}>`
+        ).join('\n\n');
+
+        const embed = new EmbedBuilder()
+            .setTitle('🗺️ Coordenadas e Warps Salvos')
+            .setColor(0x3498DB)
+            .setDescription(listText.length > 4000 ? listText.substring(0, 4000) + '...' : listText)
+            .setFooter({ text: `Total de locais: ${coords.length}` });
+
+        return interaction.reply({ embeds: [embed] });
+    }
+
+    // --- COMANDO: /teleportar ---
+    if (commandName === 'teleportar') {
+        await interaction.deferReply();
+
+        const warpName = interaction.options.getString('nome').toLowerCase().trim();
+        const player = interaction.options.getString('nick').trim();
+
+        const coords = loadCoords();
+        const coord = coords.find(c => c.name.toLowerCase() === warpName);
+
+        if (!coord) {
+            return interaction.editReply(`❌ Coordenada/Warp **${warpName}** não encontrada.`);
+        }
+
+        // Sintaxe oficial do SimpleWarp: /warp [warpName] [playerName]
+        const rconResult = await sendRconCommand(`warp ${coord.name} ${player}`);
+
+        if (rconResult.success) {
+            return interaction.editReply(`✅ **${player}** foi teleportado para o warp **${coord.name}**!`);
+        } else {
+            return interaction.editReply(`❌ Erro RCON ao teleportar: \`${rconResult.error}\`. Verifique se o servidor está online e o jogador conectado.`);
+        }
+    }
+
+    // --- COMANDO: /deletar-coordenada ---
+    if (commandName === 'deletar-coordenada') {
+        await interaction.deferReply();
+
+        const warpName = interaction.options.getString('nome').toLowerCase().trim();
+        let coords = loadCoords();
+        const coordIndex = coords.findIndex(c => c.name.toLowerCase() === warpName);
+
+        if (coordIndex === -1) {
+            return interaction.editReply(`❌ A coordenada/warp **${warpName}** não foi encontrada.`);
+        }
+
+        const targetCoord = coords[coordIndex];
+
+        // VERIFICAÇÃO DE PERMISSÃO RIGOROSA:
+        // Administrador/Gerenciador de Servidor Discord OU Criador Original da Coordenada
+        const isGuildMember = interaction.inGuild() && interaction.member;
+        const isAdmin = isGuildMember && (
+            interaction.member.permissions.has(PermissionFlagsBits.Administrator) ||
+            interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)
+        );
+        const isAuthor = targetCoord.authorId === interaction.user.id;
+
+        if (!isAdmin && !isAuthor) {
+            return interaction.editReply({
+                content: '🚫 **Acesso Negado!** Você só pode excluir coordenadas se for **Administrador** ou se tiver sido o **Criador** desta coordenada.'
+            });
+        }
+
+        // Excluir da lista local
+        coords.splice(coordIndex, 1);
+        saveCoords(coords);
+
+        // Sintaxe oficial do SimpleWarp: /deletewarp [warpName]
+        const rconResult = await sendRconCommand(`deletewarp ${targetCoord.name}`);
+
+        const embed = new EmbedBuilder()
+            .setTitle('🗑️ Coordenada / Warp Removido')
+            .setColor(0xE74C3C)
+            .setDescription(`A coordenada **\`${targetCoord.name}\`** foi excluída.`)
+            .addFields(
+                { name: 'Excluído por', value: `<@${interaction.user.id}>`, inline: true },
+                { name: 'Criador Original', value: `<@${targetCoord.authorId}>`, inline: true }
+            );
+
+        if (!rconResult.success) {
+            embed.setFooter({ text: `Aviso: Removido no Discord. Não foi possível executar no Minecraft (${rconResult.error})` });
+        } else {
+            embed.setFooter({ text: 'Removido com sucesso no Discord e no Minecraft (/deletewarp).' });
+        }
+
+        return interaction.editReply({ embeds: [embed] });
+    }
+});
+
+// ================= 7. PROTEÇÃO ANTI-CRASH GLOBAL =================
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('⚠️ [Anti-Crash] Rejeição não tratada:', reason);
+});
+
+process.on('uncaughtException', (error, origin) => {
+    console.error('⚠️ [Anti-Crash] Exceção não capturada:', error);
+});
+
+// ================= 8. INICIALIZAÇÃO DO BOT =================
+if (!CONFIG.DISCORD_TOKEN) {
+    console.error('❌ Defina a variável DISCORD_TOKEN no Replit em "Secrets" antes de ligar!');
+} else {
+    client.login(CONFIG.DISCORD_TOKEN);
+}
