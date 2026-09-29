@@ -78,47 +78,70 @@ async function sendRconCommand(command) {
     }
 }
 
-// Atualização automática do Status do Servidor (a cada 15s)
+// Atualização automática do Status do Servidor
 async function updateStatusEmbed() {
     try {
         const channel = await client.channels.fetch(process.env.STATUS_CHANNEL_ID);
         if (!channel) return;
 
         let serverStatus;
+        let ping = 0;
+        const startTime = Date.now();
+
         try {
             serverStatus = await util.status(process.env.MC_HOST, parseInt(process.env.MC_PORT || '25565'), { timeout: 5000 });
+            ping = serverStatus.roundTripLatency || (Date.now() - startTime);
         } catch (e) {
             serverStatus = null;
         }
 
-        const embed = new EmbedBuilder()
-            .setTimestamp();
+        const embed = new EmbedBuilder().setTimestamp();
 
         if (serverStatus) {
+            const online = serverStatus.players.online;
+            const max = serverStatus.players.max;
+
+            // Criação da barra visual de quadradinhos
+            const totalBlocks = 10;
+            const filledBlocks = max > 0 ? Math.round((online / max) * totalBlocks) : 0;
+            const progressBar = '🟩'.repeat(filledBlocks) + '⬛'.repeat(totalBlocks - filledBlocks);
+
+            // Lista de jogadores online (se disponível)
+            let playersText = `\`${online} / ${max}\`\n${progressBar}`;
+            if (serverStatus.players.sample && serverStatus.players.sample.length > 0) {
+                const names = serverStatus.players.sample.map(p => p.name).join(', ');
+                playersText += `\n**Online:** \`${names}\``;
+            }
+
             embed.setTitle('🎮 PanelaCraft — Status do Servidor')
-                .setColor(0x2b2d31)
+                .setColor(0x57F287) // Verde vibrante do Discord
                 .addFields(
                     { name: '🟢 Estado', value: '`ONLINE`', inline: true },
-                    { name: '👥 Jogadores', value: `\`${serverStatus.players.online} / ${serverStatus.players.max}\``, inline: true },
+                    { name: '👥 Jogadores', value: playersText, inline: true },
+                    { name: '⚡ Ping', value: `\`${ping} ms\``, inline: true },
                     { name: '📌 Versão', value: `\`${serverStatus.version.name}\``, inline: true },
                     { name: '🌐 IP do Servidor', value: `\`${process.env.MC_HOST}:${process.env.MC_PORT}\``, inline: false }
                 );
         } else {
             embed.setTitle('🎮 PanelaCraft — Status do Servidor')
-                .setColor(0xed4245)
+                .setColor(0xED4245) // Vermelho vibrante
                 .addFields(
                     { name: '🔴 Estado', value: '`OFFLINE`', inline: true },
                     { name: '🌐 IP do Servidor', value: `\`${process.env.MC_HOST}:${process.env.MC_PORT}\``, inline: true }
                 );
         }
 
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('btn_refresh_status').setLabel('Atualizar Status').setStyle(ButtonStyle.Secondary).setEmoji('🔄')
+        );
+
         const messages = await channel.messages.fetch({ limit: 10 });
-        const lastMsg = messages.find(m => m.author.id === client.user.id);
+        const lastMsg = messages.find(m => m.author.id === client.user.id && m.embeds.length > 0 && m.embeds[0].title?.includes('Status do Servidor'));
 
         if (lastMsg) {
-            await lastMsg.edit({ embeds: [embed] });
+            await lastMsg.edit({ embeds: [embed], components: [row] });
         } else {
-            await channel.send({ embeds: [embed] });
+            await channel.send({ embeds: [embed], components: [row] });
         }
     } catch (err) {
         console.error('Erro ao atualizar status:', err.message);
@@ -134,7 +157,7 @@ async function initOrUpdateCoordsPanel(client) {
         const coords = loadCoords();
         const embed = new EmbedBuilder()
             .setTitle('🗺️ Painel de Coordenadas e Warps')
-            .setColor(0x5865f2)
+            .setColor(0x5865F2)
             .setTimestamp();
 
         if (coords.length === 0) {
@@ -182,6 +205,11 @@ client.on('interactionCreate', async interaction => {
     try {
         if (interaction.isButton()) {
             const { customId } = interaction;
+
+            if (customId === 'btn_refresh_status') {
+                await interaction.deferUpdate();
+                return updateStatusEmbed();
+            }
 
             if (customId === 'btn_add_coord') {
                 const modal = new ModalBuilder()
