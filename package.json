@@ -1,3 +1,4 @@
+cat << 'EOF' > package.json
 {
   "name": "bot-panelacraft",
   "version": "1.0.0",
@@ -13,3 +14,5 @@
     "rcon-client": "^4.2.3"
   }
 }
+EOF
+
