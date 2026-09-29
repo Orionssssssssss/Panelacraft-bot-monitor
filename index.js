@@ -1,47 +1,41 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, EmbedBuilder, ActivityType, Events } = require('discord.js');
+const http = require('http');
+const { 
+  Client, 
+  GatewayIntentBits, 
+  EmbedBuilder, 
+  ActionRowBuilder, 
+  ButtonBuilder, 
+  ButtonStyle 
+} = require('discord.js');
 const util = require('minecraft-server-util');
-const fetch = globalThis.fetch || require('node-fetch');
-const express = require('express');
 
 // ==========================================
-// 1. CONFIGURAÇÕES & VARIÁVEIS DE AMBIENTE
+// CONFIGURAÇÕES E VARIÁVEIS DE AMBIENTE
 // ==========================================
-const TOKEN = process.env.DISCORD_TOKEN;
-const MC_HOST = process.env.MC_HOST;
-const MC_PORT = parseInt(process.env.MC_PORT) || 25565;
-const CHANNEL_ID = process.env.STATUS_CHANNEL_ID;
-const UPDATE_INTERVAL = (parseInt(process.env.UPDATE_SECONDS) || 15) * 1000;
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const MC_HOST = process.env.MC_HOST || 'Panelacraft.astral.ovh';
+const MC_PORT = parseInt(process.env.MC_PORT || '25941', 10);
+const STATUS_CHANNEL_ID = process.env.STATUS_CHANNEL_ID;
+const UPDATE_SECONDS = parseInt(process.env.UPDATE_SECONDS || '15', 10);
 const PORT = process.env.PORT || 8080;
-
-// Lista de nicks do Minecraft que NÃO devem ser contados (em minúsculas)
 const IGNORED_PLAYERS = (process.env.IGNORED_PLAYERS || '')
   .split(',')
-  .map(n => n.trim().toLowerCase())
+  .map(p => p.trim().toLowerCase())
   .filter(Boolean);
 
-if (!TOKEN || !MC_HOST || !CHANNEL_ID) {
-  console.error('❌ [ERRO] Variáveis de ambiente obrigatórias não encontradas! Verifique o ficheiro .env ou as variáveis na Discloud.');
+// Validação de variáveis obrigatórias
+if (!DISCORD_TOKEN) {
+  console.error('❌ ERRO: DISCORD_TOKEN não foi definido!');
   process.exit(1);
 }
 
-// ==========================================
-// 2. SERVIDOR WEB KEEP-ALIVE
-// ==========================================
-const app = express();
-app.get('/', (req, res) => {
-  res.send('🟢 Bot de Monitorização do panela Craft está ativo e a rodar!');
-});
+if (!STATUS_CHANNEL_ID) {
+  console.error('❌ ERRO: STATUS_CHANNEL_ID não foi definido!');
+  process.exit(1);
+}
 
-app.listen(PORT, () => {
-  console.log(`🌐 Servidor Web de Keep-Alive a rodar na porta ${PORT}`);
-}).on('error', (err) => {
-  console.log('ℹ️ Servidor HTTP offline ou porta ocupada, continuando apenas com o bot Discord.');
-});
-
-// ==========================================
-// 3. INICIALIZAÇÃO DO BOT DISCORD
-// ==========================================
+// Inicialização do cliente do Discord
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -49,11 +43,22 @@ const client = new Client({
   ]
 });
 
-let statusMessage = null; // Guarda a referência da mensagem para edição rápida
+let statusMessage = null;
 
 // ==========================================
-// 4. FUNÇÃO DE CONSULTA AO MINECRAFT (PING + FALLBACK + BLACKLIST)
+// FUNÇÕES AUXILIARES
 // ==========================================
+
+// Gera a barra de progresso visual para os slots de jogadores
+function createProgressBar(current, max, size = 10) {
+  if (!max || max <= 0) return '░░░░░░░░░░';
+  const percentage = Math.min(Math.max(current / max, 0), 1);
+  const progress = Math.round(size * percentage);
+  const emptyProgress = size - progress;
+  return '🟩'.repeat(progress) + '⬜'.repeat(emptyProgress);
+}
+
+// Consulta o status do servidor Minecraft (Socket Direto + Fallback REST)
 async function fetchMinecraftStatus() {
   // Tentativa 1: Socket direto via minecraft-server-util
   try {
@@ -63,16 +68,15 @@ async function fetchMinecraftStatus() {
     });
 
     const samplePlayers = result.players.sample || [];
-    const ignoredFound = samplePlayers.filter(player => 
-      IGNORED_PLAYERS.includes(player.name.toLowerCase())
-    ).length;
-
-    const realOnline = Math.max(0, result.players.online - ignoredFound);
+    const validPlayers = samplePlayers
+      .filter(player => !IGNORED_PLAYERS.includes(player.name.toLowerCase()))
+      .map(p => p.name);
 
     return {
       online: true,
-      playersOnline: realOnline,
+      playersOnline: Math.max(0, validPlayers.length),
       maxPlayers: result.players.max,
+      playerList: validPlayers,
       version: result.version.name,
       ping: result.roundTripLatency,
       motd: result.motd.clean || 'panela Craft'
@@ -85,17 +89,15 @@ async function fetchMinecraftStatus() {
 
       if (data.online) {
         const playerList = data.players?.list || [];
-        const ignoredFound = playerList.filter(name => 
-          IGNORED_PLAYERS.includes(name.toLowerCase())
-        ).length;
-
-        const rawOnline = data.players?.online || 0;
-        const realOnline = Math.max(0, rawOnline - ignoredFound);
+        const validPlayers = playerList.filter(name => 
+          !IGNORED_PLAYERS.includes(name.toLowerCase())
+        );
 
         return {
           online: true,
-          playersOnline: realOnline,
+          playersOnline: Math.max(0, validPlayers.length),
           maxPlayers: data.players?.max || 20,
+          playerList: validPlayers,
           version: data.version || '1.20.x',
           ping: data.debug?.ping || 50,
           motd: data.motd?.clean?.[0] || 'panela Craft'
@@ -109,143 +111,171 @@ async function fetchMinecraftStatus() {
   }
 }
 
-// ==========================================
-// 5. GERADOR DE EMBEDS
-// ==========================================
-function createProgressBar(online, max) {
-  const totalBlocks = 10;
-  if (max <= 0) return '⬛'.repeat(totalBlocks);
-  const percentage = Math.min(Math.max(Math.round((online / max) * totalBlocks), 0), totalBlocks);
-  return '🟩'.repeat(percentage) + '⬛'.repeat(totalBlocks - percentage);
-}
-
+// Constrói o Embed principal de Status do Servidor
 function buildStatusEmbed(data) {
-  const fullAddress = MC_PORT === 25565 ? MC_HOST : `${MC_HOST}:${MC_PORT}`;
+  const fullAddress = `${MC_HOST}:${MC_PORT}`;
 
-  if (data.online) {
-    const progressBar = createProgressBar(data.playersOnline, data.maxPlayers);
-    const pingEmoji = data.ping < 80 ? '🟢' : data.ping < 150 ? '🟡' : '🔴';
-
+  if (!data.online) {
     return new EmbedBuilder()
-      .setColor(0x2ECC71) // Verde Emerald
+      .setColor(0xE74C3C) // Vermelho
       .setTitle('🎮 Status do Servidor panela Craft')
-      .setDescription('O servidor está atualmente **ONLINE** e pronto para jogar!')
-      .setThumbnail('https://cdn.icon-icons.com/icons2/2699/PNG/512/minecraft_logo_icon_168974.png')
+      .setDescription('🔴 **O servidor está atualmente OFFLINE.**\nAguarde o reinício ou verifique com a administração.')
       .addFields(
-        {
-          name: '🌐 IP do Servidor (Clique para copiar)',
-          value: `\`\`\`${fullAddress}\`\`\``,
-          inline: false
-        },
-        {
-          name: '📊 Estado',
-          value: '🟢 **ONLINE**',
-          inline: true
-        },
-        {
-          name: '🏷️ Versão',
-          value: `\`${data.version}\``,
-          inline: true
-        },
-        {
-          name: '⚡ Latência',
-          value: `${pingEmoji} \`${data.ping}ms\``,
-          inline: true
-        },
-        {
-          name: `👥 Jogadores Online (${data.playersOnline}/${data.maxPlayers})`,
-          value: `${progressBar}\n\`${data.playersOnline} de ${data.maxPlayers} slots ocupados\``,
-          inline: false
-        }
+        { name: '🌐 IP do Servidor', value: `\`\`\`${fullAddress}\`\`\``, inline: false },
+        { name: '📊 Estado', value: '🔴 **OFFLINE**', inline: true }
       )
-      .setFooter({ text: 'panela Craft • Monitorização em Tempo Real' })
-      .setTimestamp();
-  } else {
-    return new EmbedBuilder()
-      .setColor(0xE74C3C) // Vermelho Alizarin
-      .setTitle('🎮 Status do Servidor panela Craft')
-      .setDescription('⚠️ O servidor **panela Craft** está atualmente **OFFLINE** ou a arrancar.')
       .setThumbnail('https://cdn.icon-icons.com/icons2/2699/PNG/512/minecraft_logo_icon_168974.png')
-      .addFields(
-        {
-          name: '🌐 IP do Servidor',
-          value: `\`\`\`${fullAddress}\`\`\``,
-          inline: false
-        },
-        {
-          name: '📊 Estado',
-          value: '🔴 **OFFLINE**',
-          inline: true
-        },
-        {
-          name: '💡 Como Ligar?',
-          value: 'Acede ao painel do servidor para iniciar o **panela Craft**!',
-          inline: true
-        }
-      )
       .setFooter({ text: 'panela Craft • Monitorização em Tempo Real' })
       .setTimestamp();
   }
+
+  const progressBar = createProgressBar(data.playersOnline, data.maxPlayers);
+  const pingEmoji = data.ping < 100 ? '🟢' : data.ping < 200 ? '🟡' : '🔴';
+
+  return new EmbedBuilder()
+    .setColor(0x2ECC71) // Verde
+    .setTitle('🎮 Status do Servidor panela Craft')
+    .setDescription('🟢 **O servidor está ONLINE e pronto para jogar!**')
+    .setThumbnail('https://cdn.icon-icons.com/icons2/2699/PNG/512/minecraft_logo_icon_168974.png')
+    .addFields(
+      {
+        name: '🌐 IP do Servidor (Clique para copiar)',
+        value: `\`\`\`${fullAddress}\`\`\``,
+        inline: false
+      },
+      {
+        name: '📊 Estado',
+        value: '🟢 **ONLINE**',
+        inline: true
+      },
+      {
+        name: '🏷️ Versão',
+        value: `\`${data.version}\``,
+        inline: true
+      },
+      {
+        name: '⚡ Latência',
+        value: `${pingEmoji} \`${data.ping}ms\``,
+        inline: true
+      },
+      {
+        name: `👥 Jogadores Online (${data.playersOnline}/${data.maxPlayers})`,
+        value: `${progressBar}\n\`${data.playersOnline} de ${data.maxPlayers} slots ocupados\``,
+        inline: false
+      }
+    )
+    .setFooter({ text: 'panela Craft • Monitorização em Tempo Real' })
+    .setTimestamp();
 }
 
-// ==========================================
-// 6. CICLO DE ATUALIZAÇÃO DO STATUS
-// ==========================================
+// Cria a linha contendo o botão "Ver quem está online"
+function buildActionRow() {
+  const btn = new ButtonBuilder()
+    .setCustomId('btn_ver_jogadores')
+    .setLabel('Ver quem está online')
+    .setEmoji('👥')
+    .setStyle(ButtonStyle.Primary);
+
+  return new ActionRowBuilder().addComponents(btn);
+}
+
+// Atualiza a mensagem do painel no canal do Discord
 async function updateStatus() {
   try {
-    const channel = await client.channels.fetch(CHANNEL_ID);
-    if (!channel || !channel.isTextBased()) {
-      console.error(`❌ [ERRO] Canal com ID ${CHANNEL_ID} não foi encontrado ou não é um canal de texto!`);
+    const channel = await client.channels.fetch(STATUS_CHANNEL_ID);
+    if (!channel) {
+      console.error(`❌ Canal com ID ${STATUS_CHANNEL_ID} não encontrado!`);
       return;
     }
 
     const statusData = await fetchMinecraftStatus();
     const embed = buildStatusEmbed(statusData);
+    const row = buildActionRow();
 
-    // 1. Atualizar Presença/Atividade do Bot
-    if (statusData.online) {
-      client.user.setPresence({
-        activities: [{ name: `👥 ${statusData.playersOnline}/${statusData.maxPlayers} em ${MC_HOST}`, type: ActivityType.Watching }],
-        status: 'online'
-      });
-    } else {
-      client.user.setPresence({
-        activities: [{ name: `🔴 panela Craft Offline`, type: ActivityType.Watching }],
-        status: 'dnd'
-      });
-    }
-
-    // 2. Enviar ou Editar a Mensagem no Canal
-    if (!statusMessage) {
-      const messages = await channel.messages.fetch({ limit: 10 });
-      statusMessage = messages.find(m => m.author.id === client.user.id && m.embeds.length > 0);
-    }
-
+    // Reutiliza a mensagem salva em memória se existir
     if (statusMessage) {
-      await statusMessage.edit({ embeds: [embed] });
-    } else {
-      statusMessage = await channel.send({ embeds: [embed] });
+      await statusMessage.edit({ embeds: [embed], components: [row] });
+      return;
     }
 
+    // Caso o bot tenha reiniciado, procura a mensagem anterior no canal para não duplicar
+    const messages = await channel.messages.fetch({ limit: 10 });
+    const botMsg = messages.find(m => m.author.id === client.user.id);
+
+    if (botMsg) {
+      statusMessage = await botMsg.edit({ embeds: [embed], components: [row] });
+    } else {
+      statusMessage = await channel.send({ embeds: [embed], components: [row] });
+    }
   } catch (error) {
-    console.error('⚠️ [AVISO] Falha durante o ciclo de atualização:', error.message);
+    console.error('⚠️ Erro ao atualizar o painel de status:', error.message);
   }
 }
 
 // ==========================================
-// 7. EVENTOS DO CLIENTE DISCORD
+// EVENTOS DO DISCORD
 // ==========================================
-client.once(Events.ClientReady, (c) => {
-  console.log(`✅ Bot conectado com sucesso como: ${c.user.tag}`);
-  console.log(`📡 A monitorizar o servidor panela Craft: ${MC_HOST}:${MC_PORT}`);
-  console.log(`⏱️ Intervalo de atualização: ${UPDATE_INTERVAL / 1000}s`);
 
-  // Executa a primeira verificação imediatamente
-  updateStatus();
+// Listener para o clique no botão (Resposta Privada/Efêmera)
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isButton()) return;
 
-  // Inicia o temporizador contínuo
-  setInterval(updateStatus, UPDATE_INTERVAL);
+  if (interaction.customId === 'btn_ver_jogadores') {
+    try {
+      // Adia a resposta em modo privado/efêmero (só quem clicou consegue ver)
+      await interaction.deferReply({ ephemeral: true });
+
+      const status = await fetchMinecraftStatus();
+
+      if (!status.online) {
+        return await interaction.editReply({
+          content: '🔴 **O servidor panela Craft está offline no momento.**'
+        });
+      }
+
+      const players = status.playerList || [];
+      let responseText = `📊 **Jogadores Online no panela Craft (${status.playersOnline}/${status.maxPlayers}):**\n\n`;
+
+      if (players.length > 0) {
+        const playerListFormatted = players.map(name => `• \`${name}\``).join('\n');
+        responseText += playerListFormatted;
+      } else {
+        responseText += '*Nenhum jogador conectado no momento.*';
+      }
+
+      await interaction.editReply({
+        content: responseText
+      });
+    } catch (err) {
+      console.error('Erro ao processar clique no botão:', err);
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({ content: '❌ Ocorreu um erro ao carregar a lista de jogadores.' });
+      }
+    }
+  }
 });
 
-// Autenticação
-client.login(TOKEN);
+// Evento disparado quando o bot se conecta
+client.once('ready', () => {
+  console.log(`✅ Bot conectado com sucesso como: ${client.user.tag}`);
+  console.log(`📍 Monitorizando o servidor: ${MC_HOST}:${MC_PORT}`);
+
+  // Atualização inicial
+  updateStatus();
+
+  // Loop de atualização a cada X segundos
+  setInterval(updateStatus, UPDATE_SECONDS * 1000);
+});
+
+// ==========================================
+// SERVIDOR WEB (KEEP-ALIVE PARA RENDER/KOYEB)
+// ==========================================
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Bot panela Craft está ativo e operacional!');
+}).listen(PORT, () => {
+  console.log(`🌐 Servidor Web HTTP ativo na porta ${PORT}`);
+});
+
+// Conectar o bot ao Discord
+client.login(DISCORD_TOKEN);
