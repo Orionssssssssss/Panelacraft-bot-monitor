@@ -12,6 +12,7 @@
     "express": "^4.19.2",
     "minecraft-server-util": "^5.3.5",
     "node-fetch": "^2.7.0"
+    "rcon-client": "^4.2.3"
   },
   "engines": {
     "node": ">=18.0.0"
