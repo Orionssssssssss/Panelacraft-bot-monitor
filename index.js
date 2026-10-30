@@ -20,8 +20,9 @@ const { Rcon } = require('rcon-client');
 // CONFIGURAÇÕES E VARIÁVEIS DE AMBIENTE
 // ==========================================
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const MC_HOST = process.env.MC_HOST || 'br-14.astralcloud.com.br';
-const MC_PORT = parseInt(process.env.MC_PORT || '25941', 10);
+// Configure com o endereço e a porta BEDROCK exibidos no painel da RazeHost.
+const MC_HOST = process.env.MC_HOST || '';
+const MC_PORT = parseInt(process.env.MC_PORT || '19132', 10);
 const STATUS_CHANNEL_ID = process.env.STATUS_CHANNEL_ID;
 const COORDS_CHANNEL_ID = process.env.COORDS_CHANNEL_ID;
 const UPDATE_SECONDS = parseInt(process.env.UPDATE_SECONDS || '15', 10);
@@ -82,10 +83,14 @@ function findCoordIndex(coords, search) {
 }
 
 async function sendRconCommand(command) {
+    // Não presume que a hospedagem Bedrock ofereça RCON ou usa uma porta inventada.
+    if (!process.env.RCON_HOST || !process.env.RCON_PORT || !process.env.RCON_PASSWORD) {
+        return { success: false, error: 'RCON não configurado. A RazeHost precisa oferecer RCON compatível para executar warps/teleportes.' };
+    }
     try {
         const rcon = await Rcon.connect({
-            host: process.env.RCON_HOST || MC_HOST,
-            port: parseInt(process.env.RCON_PORT || '25762', 10),
+            host: process.env.RCON_HOST,
+            port: parseInt(process.env.RCON_PORT, 10),
             password: process.env.RCON_PASSWORD,
             timeout: 5000
         });
@@ -155,54 +160,82 @@ function createProgressBar(current, max, size = 10) {
   return '🟩'.repeat(progress) + '⬜'.repeat(emptyProgress);
 }
 
+// Consulta direta pelo protocolo Bedrock (UDP).
+// Mantém a biblioteca já utilizada no projeto, sem exigir nova dependência.
 async function fetchMinecraftStatus() {
+  if (!MC_HOST) {
+    console.error('❌ MC_HOST não configurado. Informe o endereço Bedrock da RazeHost no .env.');
+    return { online: false };
+  }
+
+  const startedAt = Date.now();
+
   try {
-    const result = await util.status(MC_HOST, MC_PORT, {
-      timeout: 5000,
-      enableSRV: true
-    });
-
-    const samplePlayers = result.players.sample || [];
-    const validPlayers = samplePlayers
-      .filter(player => !IGNORED_PLAYERS.includes(player.name.toLowerCase()))
-      .map(p => p.name);
-
+    const result = await util.statusBedrock(MC_HOST, MC_PORT, { enableSRV: true });
     return {
       online: true,
-      playersOnline: result.players.online || Math.max(0, validPlayers.length),
-      maxPlayers: result.players.max,
-      playerList: validPlayers,
-      version: result.version.name,
-      ping: result.roundTripLatency,
-      motd: result.motd.clean || 'panela Craft'
+      playersOnline: Number(result.players?.online ?? 0),
+      maxPlayers: Number(result.players?.max ?? 0),
+      // A consulta UDP Bedrock não garante uma lista de nomes.
+      playerList: [],
+      version: result.version?.name || 'Bedrock',
+      ping: Date.now() - startedAt,
+      motd: result.motd?.clean || result.motd?.raw || 'panela Craft',
+      source: 'direct'
     };
   } catch (primaryError) {
+    console.warn('⚠️ Consulta UDP Bedrock falhou; tentando consulta externa:', primaryError.message);
+
+    // Fallback específico para Bedrock. A API externa pode manter cache por até 5 minutos.
     try {
-      const response = await fetch(`https://api.mcsrvstat.us/3/${MC_HOST}:${MC_PORT}`);
+      const address = encodeURIComponent(`${MC_HOST}:${MC_PORT}`);
+      const response = await fetch(`https://api.mcsrvstat.us/bedrock/3/${address}`, {
+        headers: { 'User-Agent': 'PanelaCraft-Discord-Monitor/1.0' },
+        signal: AbortSignal.timeout(7000)
+      });
+      if (!response.ok) throw new Error(`API respondeu HTTP ${response.status}`);
       const data = await response.json();
 
       if (data.online) {
-        const playerList = data.players?.list || [];
-        const validPlayers = playerList.filter(name => 
-          !IGNORED_PLAYERS.includes(name.toLowerCase())
-        );
+        const rawList = Array.isArray(data.players?.list) ? data.players.list : [];
+        const validPlayers = rawList
+          .map(player => typeof player === 'string' ? player : player?.name)
+          .filter(name => typeof name === 'string' && name.trim())
+          .filter(name => !IGNORED_PLAYERS.includes(name.toLowerCase()));
 
         return {
           online: true,
-          playersOnline: data.players?.online || Math.max(0, validPlayers.length),
-          maxPlayers: data.players?.max || 20,
+          playersOnline: Number(data.players?.online ?? validPlayers.length),
+          maxPlayers: Number(data.players?.max ?? 20),
           playerList: validPlayers,
-          version: data.version || '1.20.x',
-          ping: data.debug?.ping || 50,
-          motd: data.motd?.clean?.[0] || 'panela Craft'
+          version: data.version || 'Bedrock',
+          ping: null,
+          motd: data.motd?.clean || data.motd?.raw || 'panela Craft',
+          source: 'api'
         };
       }
     } catch (fallbackError) {
-      // Falha em ambas as tentativas
+      console.error('❌ Consulta Bedrock direta e alternativa falharam:', fallbackError.message);
     }
-
     return { online: false };
   }
+}
+
+// Busca nomes somente quando alguém clica no botão do Discord.
+async function fetchBedrockPlayerList() {
+  if (!MC_HOST) return [];
+  const address = encodeURIComponent(`${MC_HOST}:${MC_PORT}`);
+  const response = await fetch(`https://api.mcsrvstat.us/bedrock/3/${address}`, {
+    headers: { 'User-Agent': 'PanelaCraft-Discord-Monitor/1.0' },
+    signal: AbortSignal.timeout(7000)
+  });
+  if (!response.ok) throw new Error(`API respondeu HTTP ${response.status}`);
+  const data = await response.json();
+  if (!data.online || !Array.isArray(data.players?.list)) return [];
+  return data.players.list
+    .map(player => typeof player === 'string' ? player : player?.name)
+    .filter(name => typeof name === 'string' && name.trim())
+    .filter(name => !IGNORED_PLAYERS.includes(name.toLowerCase()));
 }
 
 function buildStatusEmbed(data) {
@@ -223,7 +256,8 @@ function buildStatusEmbed(data) {
   }
 
   const progressBar = createProgressBar(data.playersOnline, data.maxPlayers);
-  const pingEmoji = data.ping < 100 ? '🟢' : data.ping < 200 ? '🟡' : '🔴';
+  const pingEmoji = data.ping == null ? '⚪' : data.ping < 100 ? '🟢' : data.ping < 200 ? '🟡' : '🔴';
+  const pingText = data.ping == null ? 'Indisponível (consulta alternativa)' : `${data.ping}ms`;
 
   return new EmbedBuilder()
     .setColor(0x2ECC71)
@@ -248,7 +282,7 @@ function buildStatusEmbed(data) {
       },
       {
         name: '⚡ Latência',
-        value: `${pingEmoji} \`${data.ping}ms\``,
+        value: `${pingEmoji} \`${pingText}\``,
         inline: true
       },
       {
@@ -308,7 +342,11 @@ async function updateStatus() {
 
 client.once('ready', () => {
     console.log(`🤖 Bot conectado com sucesso como: ${client.user.tag}`);
-    console.log(`📍 Monitorizando servidor: ${MC_HOST}:${MC_PORT}`);
+    if (!MC_HOST) {
+        console.error('❌ Configure MC_HOST no .env com o endereço Bedrock da RazeHost.');
+    } else {
+        console.log(`📍 Monitorizando servidor Bedrock: ${MC_HOST}:${MC_PORT}/UDP`);
+    }
 
     // Iniciar monitorização de status
     updateStatus();
@@ -333,11 +371,22 @@ client.on('interactionCreate', async interaction => {
                     return await interaction.editReply({ content: '🔴 **O servidor panela Craft está offline no momento.**' });
                 }
 
-                const players = status.playerList || [];
-                let responseText = `📊 **Jogadores Online no panela Craft (${status.playersOnline}/${status.maxPlayers}):**\n\n`;
+                let players = status.playerList || [];
 
+                // O status Bedrock informa a contagem; a lista nominal depende da API externa.
+                if (players.length === 0 && status.playersOnline > 0) {
+                    try {
+                        players = await fetchBedrockPlayerList();
+                    } catch (error) {
+                        console.warn('Não foi possível obter a lista de jogadores:', error.message);
+                    }
+                }
+
+                let responseText = `📊 **Jogadores Online no panela Craft (${status.playersOnline}/${status.maxPlayers}):**\n\n`;
                 if (players.length > 0) {
                     responseText += players.map(name => `• \`${name}\``).join('\n');
+                } else if (status.playersOnline > 0) {
+                    responseText += '*O servidor informa a quantidade de jogadores, mas não disponibilizou os nomes nesta consulta.*';
                 } else {
                     responseText += '*Nenhum jogador conectado no momento.*';
                 }
